@@ -21,6 +21,9 @@ export function useAudioMixer(
   perStreamVolumes: Map<string, number>;
   setStreamVolume: (peerId: string, volume: number) => void;
   outputDevices: MediaDeviceInfo[];
+  playTestTone: (freq: number) => void;
+  stopTestTone: () => void;
+  activeTestFreq: number | null;
 } {
   const audioContextRef = useRef<AudioContext | null>(null);
   const pipelinesRef = useRef<Map<string, AudioPipeline>>(new Map());
@@ -125,8 +128,9 @@ export function useAudioMixer(
           audioElementsRef.current.set(peerId, el);
         }
 
-        // Web Audio graph with destination output
-        const pipeline = new AudioPipeline(stream, ctx, true);
+        // On broadcaster/playing device (localStream present), mute destination output to prevent feedback loop
+        const shouldOutputToDestination = !localStream;
+        const pipeline = new AudioPipeline(stream, ctx, shouldOutputToDestination);
         pipeline.updateSettings(audioSettings);
 
         // Connect pipeline gain to master gain for visualization
@@ -411,5 +415,8 @@ export function useAudioMixer(
     perStreamVolumes,
     setStreamVolume,
     outputDevices,
+    playTestTone,
+    stopTestTone,
+    activeTestFreq,
   };
 }

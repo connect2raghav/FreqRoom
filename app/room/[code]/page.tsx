@@ -11,6 +11,7 @@ import {
   Volume2,
   VolumeX,
   RefreshCw,
+  Zap,
   Mic,
   MicOff,
   Copy,
@@ -124,7 +125,12 @@ export default function RoomPage() {
     perStreamVolumes,
     setStreamVolume,
     outputDevices,
+    playTestTone,
+    activeTestFreq,
   } = useAudioMixer(incomingStreams, broadcastStream);
+
+  const myStats = stats.get(myPeerId);
+  const currentRtt = myStats?.rtt || 25;
 
   // Listen for Aux Approval to trigger the System Audio Capture Modal
   const [hasShownCaptureModal, setHasShownCaptureModal] = useState(false);
@@ -403,7 +409,22 @@ export default function RoomPage() {
                 title="Flush Jitter Buffer & Re-align Audio"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${isResyncing ? 'animate-spin text-jam-cyan' : ''}`} />
-                <span className="hidden sm:inline">Resync Audio</span>
+                <span className="hidden sm:inline">Resync</span>
+              </button>
+
+              {/* Dynamic Auto-Sync Button */}
+              <button
+                onClick={() => {
+                  const oneWay = Math.round(currentRtt / 2);
+                  const autoOffset = Math.max(-300, Math.min(300, -oneWay));
+                  updateSettings({ latencyOffset: autoOffset });
+                  addToast(`Audio phase auto-locked (-${oneWay}ms compensated for transport drift)`, 'success');
+                }}
+                className="flex items-center gap-1.5 rounded-xl border border-jam-cyan/30 bg-jam-cyan/10 hover:bg-jam-cyan/20 px-3.5 py-2.5 text-xs font-semibold text-jam-cyan transition active:scale-95 shadow-sm"
+                title="Automatically calculate network latency and align speaker phase"
+              >
+                <Zap className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Auto-Sync</span>
               </button>
             </div>
 
@@ -663,6 +684,9 @@ export default function RoomPage() {
         onLockRoom={lockRoom}
         perStreamVolumes={perStreamVolumes}
         onSetStreamVolume={setStreamVolume}
+        onPlayTone={playTestTone}
+        activeTestFreq={activeTestFreq}
+        currentRtt={currentRtt}
       />
 
       {/* Toast Notification Stack */}

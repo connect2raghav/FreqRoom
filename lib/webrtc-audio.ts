@@ -9,7 +9,7 @@ export async function captureSystemAudio(): Promise<MediaStream> {
   const stream = await navigator.mediaDevices.getDisplayMedia({
     video: true,
     audio: {
-      echoCancellation: false,
+      echoCancellation: true,
       noiseSuppression: false,
       autoGainControl: false,
       sampleRate: 48000,
@@ -28,6 +28,13 @@ export async function captureSystemAudio(): Promise<MediaStream> {
       'No audio track was captured. Please make sure to enable "Share tab audio" or "Share system audio" when selecting what to share.',
     );
   }
+
+  // Hint to browser encoder: high-fidelity music stream, prevent voice filtering & distortion
+  stream.getAudioTracks().forEach((track) => {
+    if ('contentHint' in track) {
+      (track as any).contentHint = 'music';
+    }
+  });
 
   return stream;
 }

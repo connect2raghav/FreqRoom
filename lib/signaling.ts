@@ -578,6 +578,12 @@ export class SignalingHub {
   ): void {
     switch (msg.type) {
       case 'join': {
+        const cleanName = (msg.displayName || '').trim();
+        if (!cleanName) {
+          // Reject empty/ghost participant names
+          return;
+        }
+
         if (this.roomState.isLocked) {
           try {
             conn.close();
@@ -586,14 +592,19 @@ export class SignalingHub {
           return;
         }
 
+        // Purge any accidental ghost participants with empty names
+        this.roomState.participants = this.roomState.participants.filter(
+          (p) => p.displayName && p.displayName.trim().length > 0,
+        );
+
         // Reconnection / Duplicate handling
         const existingIdx = this.roomState.participants.findIndex(
-          (p) => p.peerId === fromPeerId || p.displayName.trim().toLowerCase() === msg.displayName.trim().toLowerCase(),
+          (p) => p.peerId === fromPeerId || p.displayName.trim().toLowerCase() === cleanName.toLowerCase(),
         );
 
         const participant: Participant = {
           peerId: fromPeerId,
-          displayName: msg.displayName,
+          displayName: cleanName,
           role: existingIdx !== -1 ? this.roomState.participants[existingIdx].role : 'LISTENER',
           rtt: 0,
           jitter: 0,

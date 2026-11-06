@@ -60,7 +60,13 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
   }, [streamsVersion]);
 
   useEffect(() => {
-    const hub = new SignalingHub(roomCode, displayName, isAdmin);
+    const trimmedName = (displayName || '').trim();
+    if (!trimmedName) {
+      setIsConnecting(false);
+      return;
+    }
+
+    const hub = new SignalingHub(roomCode, trimmedName, isAdmin);
     hubRef.current = hub;
     setIsConnecting(true);
     setError(null);

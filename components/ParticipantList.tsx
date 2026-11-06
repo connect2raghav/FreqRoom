@@ -54,19 +54,23 @@ export default function ParticipantList({
   onKick,
   onTransferAdmin,
 }: ParticipantListProps) {
+  const validParticipants = participants.filter(
+    (p) => p.displayName && p.displayName.trim().length > 0,
+  );
+
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 mb-3 px-1">
         <Users className="w-4 h-4 text-white/60" />
         <span className="text-sm font-semibold text-white/80">Participants</span>
         <span className="ml-auto px-2 py-0.5 rounded-full text-xs font-bold bg-jam-blue/20 text-jam-blue">
-          {participants.length}
+          {validParticipants.length}
         </span>
       </div>
 
       <div className="flex-1 overflow-y-auto space-y-1.5 pr-1 scrollbar-thin scrollbar-thumb-white/10">
         <AnimatePresence mode="popLayout">
-          {participants.map((p) => {
+          {validParticipants.map((p) => {
             const peerStats = stats.get(p.peerId);
             const rtt = peerStats?.rtt ?? p.rtt;
             const isMe = p.peerId === myPeerId;
