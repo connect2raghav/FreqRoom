@@ -150,8 +150,8 @@ export default function RoomPage() {
     return roomState.participants.find((p) => p.peerId === activeId) || null;
   }, [isBroadcasting, myPeerId, roomState.activeBroadcasters, roomState.participants]);
 
-  // Is current user admin
-  const isUserAdmin = myRole === 'ADMIN' || (roomState.adminPeerId === myPeerId && !!myPeerId);
+  // Is current user admin (checks query param, computed role, or matching adminPeerId)
+  const isUserAdmin = isAdminQuery || myRole === 'ADMIN' || (roomState.adminPeerId === myPeerId && !!myPeerId);
 
   // Handle direct link copy
   const handleCopyInvite = async () => {
@@ -366,6 +366,14 @@ export default function RoomPage() {
                 >
                   <MicOff className="h-4 w-4" />
                   Stop Broadcasting
+                </button>
+              ) : isUserAdmin ? (
+                <button
+                  onClick={() => setCaptureModalOpen(true)}
+                  className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-jam-blue via-blue-500 to-jam-cyan px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-jam-blue/30 transition hover:brightness-110 active:scale-95"
+                >
+                  <Radio className="h-4 w-4" />
+                  Broadcast System Audio
                 </button>
               ) : myRole === 'BROADCASTER' ? (
                 <button

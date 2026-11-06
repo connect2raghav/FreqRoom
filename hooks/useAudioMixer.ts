@@ -28,10 +28,14 @@ export function useAudioMixer(
   const masterGainRef = useRef<GainNode | null>(null);
   const masterAnalyserRef = useRef<AnalyserNode | null>(null);
   const peakIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastVibrateRef = useRef<number>(0);
+  const testOscRef = useRef<OscillatorNode | null>(null);
+  const testGainRef = useRef<GainNode | null>(null);
 
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({
     ...DEFAULT_AUDIO_SETTINGS,
   });
+  const [activeTestFreq, setActiveTestFreq] = useState<number | null>(null);
   const [isAudioEnabled, setIsAudioEnabled] = useState(false);
   const [peakDb, setPeakDb] = useState(-Infinity);
   const [perStreamVolumes, setPerStreamVolumes] = useState<Map<string, number>>(new Map());
@@ -190,6 +194,112 @@ export function useAudioMixer(
       }
     }
   }, [localStream, audioSettings, ensureMasterNodes]);
+
+  // Haptic Sub-Bass Beat Vibration Engine ("devices vibrating at the same frequency")
+  useEffect(() => {
+    if (!audioSettings.hapticSync || !masterAnalyserRef.current) return;
+
+    const analyser = masterAnalyserRef.current;
+    const binCount = analyser.frequencyBinCount;
+    const freqData = new Uint8Array(binCount);
+
+    const threshold =
+      audioSettings.hapticSensitivity === 'high'
+        ? 110
+        : audioSettings.hapticSensitivity === 'low'
+        ? 190
+        : 145;
+
+    let animId: number;
+
+    const checkHaptics = () => {
+      analyser.getByteFrequencyData(freqData);
+
+      // Check sub-bass bins (~20 to 140 Hz)
+      let sum = 0;
+      const bassBins = Math.min(8, binCount);
+      for (let i = 0; i < bassBins; i++) {
+        sum += freqData[i];
+      }
+      const avgBass = sum / bassBins;
+
+      const now = Date.now();
+      if (avgBass > threshold && now - lastVibrateRef.current > 140) {
+        lastVibrateRef.current = now;
+        if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+          try {
+            navigator.vibrate(40);
+          } catch { /* ignore */ }
+        }
+      }
+
+      animId = requestAnimationFrame(checkHaptics);
+    };
+
+    animId = requestAnimationFrame(checkHaptics);
+
+    return () => {
+      cancelAnimationFrame(animId);
+    };
+  }, [audioSettings.hapticSync, audioSettings.hapticSensitivity]);
+
+  const stopTestTone = useCallback(() => {
+    if (testOscRef.current) {
+      try {
+        testOscRef.current.stop();
+        testOscRef.current.disconnect();
+      } catch { /* ignore */ }
+      testOscRef.current = null;
+    }
+    if (testGainRef.current) {
+      try {
+        testGainRef.current.disconnect();
+      } catch { /* ignore */ }
+      testGainRef.current = null;
+    }
+    setActiveTestFreq(null);
+  }, []);
+
+  const playTestTone = useCallback(
+    (freq: number) => {
+      if (!audioContextRef.current) {
+        enableAudio();
+      }
+      const ctx = audioContextRef.current;
+      if (!ctx) return;
+
+      if (testOscRef.current) {
+        stopTestTone();
+      }
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+
+      gain.gain.setValueAtTime(0.001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.05);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      if (masterGainRef.current) {
+        gain.connect(masterGainRef.current);
+      }
+
+      osc.start();
+      testOscRef.current = osc;
+      testGainRef.current = gain;
+      setActiveTestFreq(freq);
+
+      setTimeout(() => {
+        if (testOscRef.current === osc) {
+          stopTestTone();
+        }
+      }, 3000);
+    },
+    [enableAudio, stopTestTone],
+  );
 
   // Peak dB polling
   useEffect(() => {
