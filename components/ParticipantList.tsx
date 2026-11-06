@@ -70,7 +70,7 @@ export default function ParticipantList({
             const peerStats = stats.get(p.peerId);
             const rtt = peerStats?.rtt ?? p.rtt;
             const isMe = p.peerId === myPeerId;
-            const showPulse = p.audioLevel > 0.1;
+            const showPulse = p.audioLevel > 0.1 || p.role === 'BROADCASTER';
 
             return (
               <motion.div

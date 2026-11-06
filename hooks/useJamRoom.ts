@@ -36,6 +36,7 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isBroadcasting, setIsBroadcasting] = useState(false);
+  const [broadcastStream, setBroadcastStream] = useState<MediaStream | null>(null);
   const [, setStreamsVersion] = useState(0);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [emojiReactions, setEmojiReactions] = useState<EmojiReaction[]>([]);
@@ -95,11 +96,14 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
 
     hub.onAuxRevoked = () => {
       setIsBroadcasting(false);
+      setBroadcastStream(null);
     };
 
     hub.onKicked = () => {
       setError('You have been kicked from the room.');
       setIsConnected(false);
+      setIsBroadcasting(false);
+      setBroadcastStream(null);
       hub.disconnect();
     };
 
@@ -143,11 +147,18 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
       }
     }, STATS_POLL_INTERVAL_MS);
 
+    const handleBeforeUnload = () => {
+      hub.disconnect();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
     return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
       clearInterval(statsInterval);
       hub.disconnect();
       hubRef.current = null;
       incomingStreamsRef.current.clear();
+      setBroadcastStream(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode, displayName, isAdmin]);
@@ -177,7 +188,8 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
   const startBroadcasting = useCallback(async () => {
     if (!hubRef.current) return;
     try {
-      await hubRef.current.startBroadcasting(DEFAULT_AUDIO_SETTINGS.bitrate);
+      const stream = await hubRef.current.startBroadcasting(DEFAULT_AUDIO_SETTINGS.bitrate);
+      setBroadcastStream(stream);
       setIsBroadcasting(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start broadcasting');
@@ -186,6 +198,7 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
 
   const stopBroadcasting = useCallback(() => {
     hubRef.current?.stopBroadcasting();
+    setBroadcastStream(null);
     setIsBroadcasting(false);
   }, []);
 
@@ -221,6 +234,7 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
     hubRef.current?.disconnect();
     setIsConnected(false);
     setIsBroadcasting(false);
+    setBroadcastStream(null);
   }, []);
 
   const resyncAudio = useCallback(async () => {
@@ -228,8 +242,10 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
     if (isBroadcasting) {
       hubRef.current.stopBroadcasting();
       setIsBroadcasting(false);
+      setBroadcastStream(null);
       try {
-        await hubRef.current.startBroadcasting(DEFAULT_AUDIO_SETTINGS.bitrate);
+        const stream = await hubRef.current.startBroadcasting(DEFAULT_AUDIO_SETTINGS.bitrate);
+        setBroadcastStream(stream);
         setIsBroadcasting(true);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to resync broadcasting');
@@ -259,6 +275,7 @@ export function useJamRoom(roomCode: string, displayName: string, isAdmin: boole
     isConnecting,
     error,
     isBroadcasting,
+    broadcastStream,
     incomingStreams: stableIncomingStreams,
     chatMessages,
     emojiReactions,

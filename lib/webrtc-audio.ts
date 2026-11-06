@@ -35,104 +35,88 @@ export async function captureSystemAudio(): Promise<MediaStream> {
 /**
  * Munge an SDP string so the Opus codec is configured for high-fidelity stereo
  * at the requested bitrate with CBR and in-band FEC enabled.
+ * Uses RFC-compliant line ordering so WebRTC setDescription never fails.
  */
 export function mungeSDPForHiFi(sdp: string, bitrate: BitratePreset): string {
-  const lines = sdp.split('\r\n');
-  const result: string[] = [];
+  try {
+    const lines = sdp.split('\r\n');
+    const result: string[] = [];
 
-  // Discover the Opus payload type from `a=rtpmap:<pt> opus/48000/2`
-  let opusPayloadType: string | null = null;
-  for (const line of lines) {
-    const match = line.match(/^a=rtpmap:(\d+)\s+opus\/48000/i);
-    if (match) {
-      opusPayloadType = match[1];
-      break;
-    }
-  }
-
-  const opusParams = [
-    'stereo=1',
-    'sprop-stereo=1',
-    `maxaveragebitrate=${bitrate}`,
-    'cbr=1',
-    'useinbandfec=1',
-    'usedtx=0',
-  ].join('; ');
-
-  let fmtpFound = false;
-  let mAudioSeen = false;
-  let bLineInserted = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Track whether we've entered the m=audio section
-    if (line.startsWith('m=audio')) {
-      mAudioSeen = true;
-      bLineInserted = false;
-      result.push(line);
-      continue;
+    // Discover the Opus payload type from `a=rtpmap:<pt> opus/48000/2`
+    let opusPayloadType: string | null = null;
+    for (const line of lines) {
+      const match = line.match(/^a=rtpmap:(\d+)\s+opus\/48000/i);
+      if (match) {
+        opusPayloadType = match[1];
+        break;
+      }
     }
 
-    // Reset when a new m= section starts
-    if (line.startsWith('m=') && !line.startsWith('m=audio')) {
-      mAudioSeen = false;
-    }
+    const opusParams = [
+      'stereo=1',
+      'sprop-stereo=1',
+      `maxaveragebitrate=${bitrate}`,
+      'cbr=1',
+      'useinbandfec=1',
+      'usedtx=0',
+    ].join('; ');
 
-    // Insert b=AS after m=audio if not already present
-    if (mAudioSeen && !bLineInserted) {
-      // Check if next meaningful line is already a b= line
-      if (!line.startsWith('b=')) {
+    let fmtpFound = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      // RFC 4566 / 8866: b= lines MUST come AFTER c= lines in SDP
+      if (line.startsWith('c=IN IP4') || line.startsWith('c=IN IP6')) {
+        result.push(line);
         result.push(`b=AS:${Math.ceil(bitrate / 1000)}`);
+        continue;
       }
-      bLineInserted = true;
+
+      // Replace or augment the existing a=fmtp line for Opus
+      if (opusPayloadType && line.startsWith(`a=fmtp:${opusPayloadType}`)) {
+        fmtpFound = true;
+        // Strip existing params we're overriding
+        const paramsToOverride = [
+          'stereo',
+          'sprop-stereo',
+          'maxaveragebitrate',
+          'cbr',
+          'useinbandfec',
+          'usedtx',
+        ];
+        let existingParams = line.replace(/^a=fmtp:\d+\s*/, '');
+        for (const key of paramsToOverride) {
+          existingParams = existingParams.replace(
+            new RegExp(`\\b${key}=\\S+;?\\s*`, 'gi'),
+            '',
+          );
+        }
+        existingParams = existingParams.replace(/;\s*$/, '').trim();
+
+        const combined = existingParams
+          ? `${existingParams}; ${opusParams}`
+          : opusParams;
+        result.push(`a=fmtp:${opusPayloadType} ${combined}`);
+        continue;
+      }
+
+      result.push(line);
     }
 
-    // Replace or augment the existing a=fmtp line for Opus
-    if (opusPayloadType && line.startsWith(`a=fmtp:${opusPayloadType}`)) {
-      fmtpFound = true;
-      // Strip existing params we're overriding
-      const paramsToOverride = [
-        'stereo',
-        'sprop-stereo',
-        'maxaveragebitrate',
-        'cbr',
-        'useinbandfec',
-        'usedtx',
-      ];
-      const existingMatch = line.match(/^a=fmtp:\d+\s+(.*)/);
-      let existingParams = existingMatch ? existingMatch[1] : '';
-      for (const key of paramsToOverride) {
-        existingParams = existingParams.replace(
-          new RegExp(`\\b${key}=\\S+;?\\s*`, 'g'),
-          '',
-        );
+    // If no fmtp line existed for opus, add one after the rtpmap line
+    if (!fmtpFound && opusPayloadType) {
+      const idx = result.findIndex((l) => l.startsWith(`a=rtpmap:${opusPayloadType}`));
+      if (idx !== -1) {
+        result.splice(idx + 1, 0, `a=fmtp:${opusPayloadType} ${opusParams}`);
       }
-      existingParams = existingParams.replace(/;\s*$/, '').trim();
-
-      const combined = existingParams
-        ? `${existingParams}; ${opusParams}`
-        : opusParams;
-      result.push(`a=fmtp:${opusPayloadType} ${combined}`);
-      continue;
     }
 
-    result.push(line);
+    return result.join('\r\n');
+  } catch (err) {
+    console.warn('Failed to munge SDP, falling back to original:', err);
+    return sdp;
   }
-
-  // If no fmtp line existed for opus, add one after the rtpmap line
-  if (!fmtpFound && opusPayloadType) {
-    const finalResult: string[] = [];
-    for (const line of result) {
-      finalResult.push(line);
-      if (line === `a=rtpmap:${opusPayloadType} opus/48000/2`) {
-        finalResult.push(`a=fmtp:${opusPayloadType} ${opusParams}`);
-      }
-    }
-    return finalResult.join('\r\n');
-  }
-
-  return result.join('\r\n');
 }
 
 /**
@@ -150,8 +134,15 @@ export class AudioPipeline {
   private readonly trebleEQ: BiquadFilterNode;
   private readonly ctx: AudioContext;
 
-  constructor(stream: MediaStream, audioContext: AudioContext) {
+  private readonly connectDestination: boolean;
+
+  constructor(
+    stream: MediaStream,
+    audioContext: AudioContext,
+    connectDestination: boolean = true,
+  ) {
     this.ctx = audioContext;
+    this.connectDestination = connectDestination;
 
     // Source
     this.source = audioContext.createMediaStreamSource(stream);
@@ -195,7 +186,9 @@ export class AudioPipeline {
     this.midEQ.connect(this.trebleEQ);
     this.trebleEQ.connect(this.gainNode);
     this.gainNode.connect(this.analyser);
-    this.analyser.connect(audioContext.destination);
+    if (this.connectDestination) {
+      this.analyser.connect(audioContext.destination);
+    }
   }
 
   /**

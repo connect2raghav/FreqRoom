@@ -33,7 +33,7 @@ export default function BroadcasterCard({
   onRevoke,
   onMute,
 }: BroadcasterCardProps) {
-  const isActive = broadcaster !== null && broadcaster.audioLevel > 0.01;
+  const isActive = broadcaster !== null && peakDb > -55;
   const bitrateLabel = `${bitrate / 1000} kbps`;
   const roleBadge = broadcaster?.role === 'ADMIN' ? 'DJ' : 'On The Aux';
 

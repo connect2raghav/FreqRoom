@@ -51,8 +51,7 @@ export class SignalingHub {
   onAuxDenied: (() => void) | null = null;
   onAuxRevoked: (() => void) | null = null;
   onKicked: (() => void) | null = null;
-  onIncomingStream: ((peerId: string, stream: MediaStream) => void) | null =
-    null;
+  onIncomingStream: ((peerId: string, stream: MediaStream) => void) | null = null;
   onStreamRemoved: ((peerId: string) => void) | null = null;
   onError: ((error: Error) => void) | null = null;
   onConnectionStateChange: ((connected: boolean) => void) | null = null;
@@ -68,12 +67,14 @@ export class SignalingHub {
   private mediaConnections: Map<string, MediaConnection> = new Map();
   private outgoingMediaConnections: Map<string, MediaConnection> = new Map();
   private broadcastStream: MediaStream | null = null;
-  private statsInterval: ReturnType<typeof setInterval> | null = null;
-  private pingIntervals: Map<string, ReturnType<typeof setInterval>> =
-    new Map();
+  private currentBitrate: BitratePreset = 320000;
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private sweepInterval: ReturnType<typeof setInterval> | null = null;
+  private lastSeen: Map<string, number> = new Map();
+  private lastAdminSeen: number = Date.now();
   private rttMap: Map<string, { rtt: number; jitter: number }> = new Map();
-  private pendingPongs: Map<string, number> = new Map(); // peerId → sent ts
-  private adminDataConn: DataConnection | null = null; // listener → admin
+  private adminDataConn: DataConnection | null = null;
+  private isDestroyed = false;
 
   constructor(roomCode: string, displayName: string, isAdmin: boolean) {
     this.roomCode = roomCode;
@@ -102,6 +103,7 @@ export class SignalingHub {
 
   async connect(): Promise<void> {
     const Ctor = await getPeerClass();
+    this.isDestroyed = false;
 
     return new Promise<void>((resolve, reject) => {
       if (this.isAdmin) {
@@ -113,7 +115,25 @@ export class SignalingHub {
   }
 
   disconnect(): void {
+    this.isDestroyed = true;
     this.stopBroadcasting();
+
+    // Notify room of departure
+    if (this.isAdmin) {
+      this.broadcastToAll({ type: 'peer-left', peerId: this.myPeerId });
+    } else {
+      this.sendToAdmin({ type: 'leave', peerId: this.myPeerId });
+    }
+
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+
+    if (this.sweepInterval) {
+      clearInterval(this.sweepInterval);
+      this.sweepInterval = null;
+    }
 
     this.dataConnections.forEach((c) => {
       try {
@@ -135,14 +155,6 @@ export class SignalingHub {
       } catch { /* ignore */ }
     });
     this.outgoingMediaConnections.clear();
-
-    if (this.statsInterval) {
-      clearInterval(this.statsInterval);
-      this.statsInterval = null;
-    }
-
-    this.pingIntervals.forEach((iv) => clearInterval(iv));
-    this.pingIntervals.clear();
 
     if (this.adminDataConn) {
       try {
@@ -168,12 +180,10 @@ export class SignalingHub {
   approveAux(peerId: string): void {
     if (!this.isAdmin) return;
 
-    // Remove from aux requests
     this.roomState.auxRequests = this.roomState.auxRequests.filter(
       (r) => r.peerId !== peerId,
     );
 
-    // In single-dj mode, revoke current broadcaster first
     if (this.roomState.mode === 'single-dj') {
       const current = this.roomState.activeBroadcasters[0];
       if (current && current !== peerId) {
@@ -181,7 +191,6 @@ export class SignalingHub {
       }
     }
 
-    // In jam-session mode, check cap
     if (
       this.roomState.mode === 'jam-session' &&
       this.roomState.activeBroadcasters.length >= this.roomState.maxBroadcasters
@@ -190,7 +199,6 @@ export class SignalingHub {
       return;
     }
 
-    // Promote
     const participant = this.roomState.participants.find(
       (p) => p.peerId === peerId,
     );
@@ -225,10 +233,7 @@ export class SignalingHub {
     if (participant) participant.role = 'LISTENER';
 
     this.sendToPeer(peerId, { type: 'aux-revoked', targetPeerId: peerId });
-
-    // Notify all peers so they can tear down the stream
     this.broadcastToAll({ type: 'peer-left', peerId });
-
     this.broadcastRoomState();
   }
 
@@ -299,32 +304,48 @@ export class SignalingHub {
 
   requestAux(): void {
     if (this.isAdmin) {
-      // Admin adds own request (auto-approve flow handled by consumer)
+      // Admin self-approves aux
+      this.onAuxApproved?.();
       return;
     }
     this.sendToAdmin({ type: 'aux-request' });
   }
 
-  async startBroadcasting(bitrate: BitratePreset): Promise<MediaStream> {
+  async startBroadcasting(bitrate: BitratePreset = 320000): Promise<MediaStream> {
     const stream = await captureSystemAudio();
     this.broadcastStream = stream;
+    this.currentBitrate = bitrate;
+
+    // Listen for stream track ending (user clicks "Stop Sharing" on Chrome prompt)
+    stream.getAudioTracks().forEach((track) => {
+      track.onended = () => {
+        this.stopBroadcasting();
+        this.onAuxRevoked?.();
+      };
+    });
 
     if (this.isAdmin) {
-      // Admin knows all peers — call each one directly
+      // Add admin to activeBroadcasters if not already
+      if (!this.roomState.activeBroadcasters.includes(this.myPeerId)) {
+        this.roomState.activeBroadcasters.push(this.myPeerId);
+      }
+      const me = this.roomState.participants.find((p) => p.peerId === this.myPeerId);
+      if (me) me.role = 'ADMIN';
+
+      // Call each connected peer directly
       this.dataConnections.forEach((_conn, peerId) => {
-        this.callPeerWithStream(peerId, stream, bitrate);
+        if (peerId !== this.myPeerId) {
+          this.callPeerWithStream(peerId, stream, bitrate);
+        }
       });
+
+      this.broadcastRoomState();
     } else {
-      // Ask admin for the peer list, then call everyone
+      // Non-admin broadcaster: tell admin we're ready
       this.sendToAdmin({
         type: 'broadcaster-ready',
         peerId: this.myPeerId,
       });
-
-      // The admin will respond with a peer-list message.
-      // Actual calling is handled in the peer-list handler below.
-      // Store bitrate for when the peer-list arrives.
-      (this as any)._pendingBroadcastBitrate = bitrate;
     }
 
     return stream;
@@ -341,6 +362,13 @@ export class SignalingHub {
       } catch { /* ignore */ }
     });
     this.outgoingMediaConnections.clear();
+
+    if (this.isAdmin) {
+      this.roomState.activeBroadcasters = this.roomState.activeBroadcasters.filter(
+        (id) => id !== this.myPeerId,
+      );
+      this.broadcastRoomState();
+    }
   }
 
   sendChat(message: string): void {
@@ -381,11 +409,20 @@ export class SignalingHub {
   // ------------------------------------------------------------------
 
   getRoomState(): RoomState {
-    return this.roomState;
+    return {
+      ...this.roomState,
+      participants: [...this.roomState.participants],
+      activeBroadcasters: [...this.roomState.activeBroadcasters],
+      auxRequests: [...this.roomState.auxRequests],
+    };
   }
 
   getMyPeerId(): string {
     return this.myPeerId;
+  }
+
+  getBroadcastStream(): MediaStream | null {
+    return this.broadcastStream;
   }
 
   getStats(): Map<string, { rtt: number; jitter: number }> {
@@ -408,7 +445,6 @@ export class SignalingHub {
       this.myPeerId = id;
       this.roomState.adminPeerId = id;
 
-      // Seed admin as the first participant
       const adminParticipant: Participant = {
         peerId: id,
         displayName: this.displayName,
@@ -420,33 +456,38 @@ export class SignalingHub {
         joinedAt: Date.now(),
       };
       this.roomState.participants = [adminParticipant];
-      this.onRoomStateUpdate?.(this.roomState);
+      this.broadcastRoomState();
       this.onConnectionStateChange?.(true);
+
+      // Start ping loop and stale peer sweeper
+      this.startHeartbeatLoops();
+
       resolve();
     });
 
-    // Incoming data connections from joiners
     peer.on('connection', (conn: DataConnection) => {
       this.handleAdminIncomingDataConn(conn);
     });
 
-    // Incoming media connections (e.g. from a broadcaster)
     peer.on('call', (mc: MediaConnection) => {
       this.handleIncomingMedia(mc);
     });
 
     peer.on('disconnected', () => {
-      this.onConnectionStateChange?.(false);
-      try {
-        peer.reconnect();
-      } catch { /* ignore */ }
+      if (!this.isDestroyed) {
+        this.onConnectionStateChange?.(false);
+        try {
+          peer.reconnect();
+        } catch { /* ignore */ }
+      }
     });
 
     peer.on('error', (err: Error) => {
-      // If the ID is taken, try with a random suffix
       if ((err as any).type === 'unavailable-id') {
-        const fallbackId = `${this.myPeerId}-${generateId().slice(0, 6)}`;
+        const fallbackId = `${buildAdminPeerId(this.roomCode)}-${generateId().slice(0, 4)}`;
         this.myPeerId = fallbackId;
+        peer.destroy();
+
         const fallback = new Ctor(fallbackId, { debug: 0 });
         this.peer = fallback;
 
@@ -464,8 +505,9 @@ export class SignalingHub {
             joinedAt: Date.now(),
           };
           this.roomState.participants = [adminParticipant];
-          this.onRoomStateUpdate?.(this.roomState);
+          this.broadcastRoomState();
           this.onConnectionStateChange?.(true);
+          this.startHeartbeatLoops();
           resolve();
         });
 
@@ -475,13 +517,6 @@ export class SignalingHub {
 
         fallback.on('call', (mc: MediaConnection) => {
           this.handleIncomingMedia(mc);
-        });
-
-        fallback.on('disconnected', () => {
-          this.onConnectionStateChange?.(false);
-          try {
-            fallback.reconnect();
-          } catch { /* ignore */ }
         });
 
         fallback.on('error', (e: Error) => {
@@ -497,64 +532,69 @@ export class SignalingHub {
   private handleAdminIncomingDataConn(conn: DataConnection): void {
     const remotePeerId = conn.peer;
 
-    conn.on('open', () => {
+    const setupConn = () => {
       this.dataConnections.set(remotePeerId, conn);
+      this.lastSeen.set(remotePeerId, Date.now());
+      // Immediately send current room state to joining peer
+      conn.send({
+        type: 'room-state',
+        state: this.getRoomState(),
+      } satisfies SignalMessage);
+    };
 
-      // Start pinging this peer
-      const iv = setInterval(() => {
-        this.sendToPeer(remotePeerId, {
-          type: 'ping',
-          timestamp: Date.now(),
-        });
-        this.pendingPongs.set(remotePeerId, Date.now());
-      }, 3000);
-      this.pingIntervals.set(remotePeerId, iv);
-    });
+    if (conn.open) {
+      setupConn();
+    } else {
+      conn.on('open', setupConn);
+    }
 
     conn.on('data', (raw: unknown) => {
       const msg = raw as SignalMessage;
+      this.lastSeen.set(remotePeerId, Date.now());
+      if (!this.dataConnections.has(remotePeerId)) {
+        this.dataConnections.set(remotePeerId, conn);
+      }
       this.handleAdminMessage(remotePeerId, msg, conn);
     });
 
     conn.on('close', () => {
       this.dataConnections.delete(remotePeerId);
-      const piv = this.pingIntervals.get(remotePeerId);
-      if (piv) {
-        clearInterval(piv);
-        this.pingIntervals.delete(remotePeerId);
-      }
+      this.lastSeen.delete(remotePeerId);
       this.rttMap.delete(remotePeerId);
       this.removePeerFromState(remotePeerId);
       this.broadcastRoomState();
+      this.broadcastToAll({ type: 'peer-left', peerId: remotePeerId });
     });
 
     conn.on('error', (err: Error) => {
-      this.onError?.(err);
+      console.warn('Admin connection error with peer:', remotePeerId, err);
     });
   }
 
   private handleAdminMessage(
     fromPeerId: string,
     msg: SignalMessage,
-    _conn: DataConnection,
+    conn: DataConnection,
   ): void {
     switch (msg.type) {
       case 'join': {
         if (this.roomState.isLocked) {
-          const dc = this.dataConnections.get(fromPeerId);
-          if (dc) {
-            try {
-              dc.close();
-            } catch { /* ignore */ }
-            this.dataConnections.delete(fromPeerId);
-          }
+          try {
+            conn.close();
+          } catch { /* ignore */ }
+          this.dataConnections.delete(fromPeerId);
           return;
         }
+
+        // Reconnection / Duplicate handling
+        const existingIdx = this.roomState.participants.findIndex(
+          (p) => p.peerId === fromPeerId || p.displayName.trim().toLowerCase() === msg.displayName.trim().toLowerCase(),
+        );
 
         const participant: Participant = {
           peerId: fromPeerId,
           displayName: msg.displayName,
-          role: 'LISTENER',
+          role: existingIdx !== -1 ? this.roomState.participants[existingIdx].role : 'LISTENER',
           rtt: 0,
           jitter: 0,
           isMuted: false,
@@ -562,20 +602,45 @@ export class SignalingHub {
           joinedAt: Date.now(),
         };
 
-        // Avoid duplicates
-        if (
-          !this.roomState.participants.find((p) => p.peerId === fromPeerId)
-        ) {
+        if (existingIdx !== -1) {
+          const oldPeerId = this.roomState.participants[existingIdx].peerId;
+          if (oldPeerId !== fromPeerId) {
+            this.dataConnections.delete(oldPeerId);
+            this.lastSeen.delete(oldPeerId);
+          }
+          this.roomState.participants[existingIdx] = participant;
+        } else {
           this.roomState.participants.push(participant);
         }
 
-        this.broadcastRoomState();
+        this.lastSeen.set(fromPeerId, Date.now());
 
-        // Notify others of the new peer
+        // Send fresh state directly to the new joiner
+        conn.send({
+          type: 'room-state',
+          state: this.getRoomState(),
+        } satisfies SignalMessage);
+
+        // Broadcast to everyone
+        this.broadcastRoomState();
         this.broadcastToAll({
           type: 'peer-joined',
           participant,
         });
+
+        // If Admin is currently broadcasting, call the new peer with the stream
+        if (this.broadcastStream) {
+          this.callPeerWithStream(fromPeerId, this.broadcastStream, this.currentBitrate);
+        }
+        break;
+      }
+
+      case 'leave': {
+        this.dataConnections.delete(fromPeerId);
+        this.lastSeen.delete(fromPeerId);
+        this.removePeerFromState(fromPeerId);
+        this.broadcastRoomState();
+        this.broadcastToAll({ type: 'peer-left', peerId: fromPeerId });
         break;
       }
 
@@ -587,9 +652,7 @@ export class SignalingHub {
               ?.displayName ?? 'Unknown',
           requestedAt: Date.now(),
         };
-        if (
-          !this.roomState.auxRequests.find((r) => r.peerId === fromPeerId)
-        ) {
+        if (!this.roomState.auxRequests.find((r) => r.peerId === fromPeerId)) {
           this.roomState.auxRequests.push(req);
         }
         this.broadcastRoomState();
@@ -617,37 +680,37 @@ export class SignalingHub {
       }
 
       case 'pong': {
-        const sentAt = this.pendingPongs.get(fromPeerId);
-        if (sentAt) {
-          const rtt = Date.now() - sentAt;
-          const prev = this.rttMap.get(fromPeerId);
-          const jitter = prev ? Math.abs(rtt - prev.rtt) : 0;
-          this.rttMap.set(fromPeerId, { rtt, jitter });
+        const rtt = Math.max(0, Date.now() - msg.timestamp);
+        const prev = this.rttMap.get(fromPeerId);
+        const jitter = prev ? Math.abs(rtt - prev.rtt) : 0;
+        this.rttMap.set(fromPeerId, { rtt, jitter });
 
-          const participant = this.roomState.participants.find(
-            (p) => p.peerId === fromPeerId,
-          );
-          if (participant) {
-            participant.rtt = rtt;
-            participant.jitter = jitter;
-          }
-          this.pendingPongs.delete(fromPeerId);
+        const p = this.roomState.participants.find((x) => x.peerId === fromPeerId);
+        if (p) {
+          p.rtt = rtt;
+          p.jitter = jitter;
         }
         break;
       }
 
       case 'broadcaster-ready': {
-        // Send the peer list to the broadcaster so it can call everyone
+        // Broadcaster is ready. Send peer list and notify all listeners to connect
         const peers = Array.from(this.dataConnections.keys()).filter(
           (id) => id !== fromPeerId,
         );
-        // Also include admin's own peer id if admin is a listener
         if (this.myPeerId !== fromPeerId) {
           peers.push(this.myPeerId);
         }
+
         this.sendToPeer(fromPeerId, {
           type: 'peer-list',
           peers: [...new Set(peers)],
+        });
+
+        // Notify all peers to expect/call broadcaster
+        this.broadcastToAll({
+          type: 'connect-to-broadcaster',
+          broadcasterPeerId: fromPeerId,
         });
         break;
       }
@@ -678,23 +741,34 @@ export class SignalingHub {
     peer.on('open', (id: string) => {
       this.myPeerId = id;
 
-      // Connect data channel to admin
       const adminId = buildAdminPeerId(this.roomCode);
       const conn = peer.connect(adminId, { reliable: true });
 
-      conn.on('open', () => {
+      const setupListenerConn = () => {
         this.adminDataConn = conn;
         this.dataConnections.set(adminId, conn);
+        this.lastAdminSeen = Date.now();
 
-        // Announce ourselves
-        conn.send({ type: 'join', displayName: this.displayName } as SignalMessage);
+        // Announce ourselves to Admin
+        conn.send({
+          type: 'join',
+          displayName: this.displayName,
+        } satisfies SignalMessage);
 
         this.onConnectionStateChange?.(true);
+        this.startHeartbeatLoops();
         resolve();
-      });
+      };
+
+      if (conn.open) {
+        setupListenerConn();
+      } else {
+        conn.on('open', setupListenerConn);
+      }
 
       conn.on('data', (raw: unknown) => {
         const msg = raw as SignalMessage;
+        this.lastAdminSeen = Date.now();
         this.handleListenerMessage(msg);
       });
 
@@ -709,16 +783,17 @@ export class SignalingHub {
       });
     });
 
-    // Incoming media from broadcasters
     peer.on('call', (mc: MediaConnection) => {
       this.handleIncomingMedia(mc);
     });
 
     peer.on('disconnected', () => {
-      this.onConnectionStateChange?.(false);
-      try {
-        peer.reconnect();
-      } catch { /* ignore */ }
+      if (!this.isDestroyed) {
+        this.onConnectionStateChange?.(false);
+        try {
+          peer.reconnect();
+        } catch { /* ignore */ }
+      }
     });
 
     peer.on('error', (err: Error) => {
@@ -730,8 +805,47 @@ export class SignalingHub {
   private handleListenerMessage(msg: SignalMessage): void {
     switch (msg.type) {
       case 'room-state': {
-        this.roomState = msg.state;
-        this.onRoomStateUpdate?.(this.roomState);
+        this.roomState = {
+          ...msg.state,
+          participants: [...msg.state.participants],
+          activeBroadcasters: [...msg.state.activeBroadcasters],
+          auxRequests: [...msg.state.auxRequests],
+        };
+        this.onRoomStateUpdate?.(this.getRoomState());
+        break;
+      }
+
+      case 'peer-joined': {
+        const p = msg.participant;
+        const exists = this.roomState.participants.some((x) => x.peerId === p.peerId);
+        if (!exists) {
+          this.roomState.participants.push(p);
+          this.onRoomStateUpdate?.(this.getRoomState());
+        }
+
+        // If we are broadcasting, call this new joiner with our stream
+        if (this.broadcastStream && p.peerId !== this.myPeerId) {
+          this.callPeerWithStream(p.peerId, this.broadcastStream, this.currentBitrate);
+        }
+        break;
+      }
+
+      case 'peer-left': {
+        this.onStreamRemoved?.(msg.peerId);
+        const mc = this.mediaConnections.get(msg.peerId);
+        if (mc) {
+          try {
+            mc.close();
+          } catch { /* ignore */ }
+          this.mediaConnections.delete(msg.peerId);
+        }
+        this.roomState.participants = this.roomState.participants.filter(
+          (p) => p.peerId !== msg.peerId,
+        );
+        this.roomState.activeBroadcasters = this.roomState.activeBroadcasters.filter(
+          (id) => id !== msg.peerId,
+        );
+        this.onRoomStateUpdate?.(this.getRoomState());
         break;
       }
 
@@ -766,9 +880,10 @@ export class SignalingHub {
       }
 
       case 'connect-to-broadcaster': {
-        if (this.peer && msg.broadcasterPeerId !== this.myPeerId) {
-          const mc = this.peer.call(msg.broadcasterPeerId, new MediaStream());
-          this.handleIncomingMedia(mc);
+        // If someone else became broadcaster and we don't have a call yet:
+        // We can request the broadcaster to call us
+        if (msg.broadcasterPeerId !== this.myPeerId) {
+          // If we are connected directly or through admin, the broadcaster will call us.
         }
         break;
       }
@@ -789,14 +904,10 @@ export class SignalingHub {
       }
 
       case 'pong': {
-        const sentAt = this.pendingPongs.get(this.roomState.adminPeerId);
-        if (sentAt) {
-          const rtt = Date.now() - sentAt;
-          const prev = this.rttMap.get(this.roomState.adminPeerId);
-          const jitter = prev ? Math.abs(rtt - prev.rtt) : 0;
-          this.rttMap.set(this.roomState.adminPeerId, { rtt, jitter });
-          this.pendingPongs.delete(this.roomState.adminPeerId);
-        }
+        const rtt = Math.max(0, Date.now() - msg.timestamp);
+        const prev = this.rttMap.get(this.roomState.adminPeerId);
+        const jitter = prev ? Math.abs(rtt - prev.rtt) : 0;
+        this.rttMap.set(this.roomState.adminPeerId, { rtt, jitter });
         break;
       }
 
@@ -808,46 +919,16 @@ export class SignalingHub {
       }
 
       case 'peer-list': {
-        // If we're broadcasting and waiting for the peer list, call each peer
-        const bitrate: BitratePreset =
-          (this as any)._pendingBroadcastBitrate ?? 160000;
         if (this.broadcastStream) {
           for (const targetPeerId of msg.peers) {
             if (targetPeerId !== this.myPeerId) {
               this.callPeerWithStream(
                 targetPeerId,
                 this.broadcastStream,
-                bitrate,
+                this.currentBitrate,
               );
             }
           }
-          delete (this as any)._pendingBroadcastBitrate;
-        }
-        break;
-      }
-
-      case 'peer-joined': {
-        // If we're an active broadcaster, call the new peer with our stream
-        if (this.broadcastStream) {
-          const bitrate: BitratePreset =
-            (this as any)._pendingBroadcastBitrate ?? 160000;
-          this.callPeerWithStream(
-            msg.participant.peerId,
-            this.broadcastStream,
-            bitrate,
-          );
-        }
-        break;
-      }
-
-      case 'peer-left': {
-        this.onStreamRemoved?.(msg.peerId);
-        const mc = this.mediaConnections.get(msg.peerId);
-        if (mc) {
-          try {
-            mc.close();
-          } catch { /* ignore */ }
-          this.mediaConnections.delete(msg.peerId);
         }
         break;
       }
@@ -855,7 +936,6 @@ export class SignalingHub {
       case 'transfer-admin': {
         if (msg.targetPeerId === this.myPeerId) {
           this.isAdmin = true;
-          // Re-initialize as admin is complex; for now update local role
         }
         break;
       }
@@ -870,7 +950,6 @@ export class SignalingHub {
   // ------------------------------------------------------------------
 
   private handleIncomingMedia(mc: MediaConnection): void {
-    // Answer with no outgoing stream (receive-only)
     mc.answer();
 
     mc.on('stream', (stream: MediaStream) => {
@@ -884,7 +963,7 @@ export class SignalingHub {
     });
 
     mc.on('error', (err: Error) => {
-      this.onError?.(err);
+      console.warn('Incoming media error with peer:', mc.peer, err);
     });
   }
 
@@ -893,23 +972,83 @@ export class SignalingHub {
     stream: MediaStream,
     bitrate: BitratePreset,
   ): void {
-    if (!this.peer) return;
+    if (!this.peer || targetPeerId === this.myPeerId) return;
 
-    const mc = this.peer.call(targetPeerId, stream, {
-      sdpTransform: (sdp: string) => mungeSDPForHiFi(sdp, bitrate),
-    });
+    try {
+      const mc = this.peer.call(targetPeerId, stream, {
+        sdpTransform: (sdp: string) => mungeSDPForHiFi(sdp, bitrate),
+      });
 
-    if (!mc) return;
+      if (!mc) return;
 
-    this.outgoingMediaConnections.set(targetPeerId, mc);
+      this.outgoingMediaConnections.set(targetPeerId, mc);
 
-    mc.on('close', () => {
-      this.outgoingMediaConnections.delete(targetPeerId);
-    });
+      mc.on('close', () => {
+        this.outgoingMediaConnections.delete(targetPeerId);
+      });
 
-    mc.on('error', (err: Error) => {
-      this.onError?.(err);
-    });
+      mc.on('error', (err: Error) => {
+        console.warn('Outgoing call error with peer:', targetPeerId, err);
+      });
+    } catch (err) {
+      console.warn('Failed to call peer with stream:', targetPeerId, err);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Private — heartbeat & presence
+  // ------------------------------------------------------------------
+
+  private startHeartbeatLoops(): void {
+    if (this.pingInterval) clearInterval(this.pingInterval);
+    if (this.sweepInterval) clearInterval(this.sweepInterval);
+
+    // 1. Send pings every 2500ms
+    this.pingInterval = setInterval(() => {
+      if (this.isDestroyed) return;
+      const now = Date.now();
+      if (this.isAdmin) {
+        this.broadcastToAll({ type: 'ping', timestamp: now });
+      } else {
+        this.sendToAdmin({ type: 'ping', timestamp: now });
+      }
+    }, 2500);
+
+    // 2. Admin sweeps for stale/dropped peers every 2500ms
+    if (this.isAdmin) {
+      this.sweepInterval = setInterval(() => {
+        if (this.isDestroyed) return;
+        const now = Date.now();
+        let changed = false;
+
+        const activeParticipants = this.roomState.participants.filter((p) => {
+          if (p.peerId === this.myPeerId) return true; // keep admin
+
+          const last = this.lastSeen.get(p.peerId) || p.joinedAt;
+          // If no pong or activity for 7000ms -> peer dropped!
+          if (now - last > 7000) {
+            changed = true;
+            this.dataConnections.delete(p.peerId);
+            this.lastSeen.delete(p.peerId);
+            this.rttMap.delete(p.peerId);
+            this.broadcastToAll({ type: 'peer-left', peerId: p.peerId });
+            return false;
+          }
+          return true;
+        });
+
+        if (changed) {
+          this.roomState.participants = activeParticipants;
+          this.roomState.activeBroadcasters = this.roomState.activeBroadcasters.filter(
+            (id) => activeParticipants.some((p) => p.peerId === id),
+          );
+          this.roomState.auxRequests = this.roomState.auxRequests.filter(
+            (r) => activeParticipants.some((p) => p.peerId === r.peerId),
+          );
+          this.broadcastRoomState();
+        }
+      }, 2500);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -921,9 +1060,7 @@ export class SignalingHub {
     if (conn && conn.open) {
       try {
         conn.send(msg);
-      } catch {
-        /* connection may have closed between check and send */
-      }
+      } catch { /* ignore */ }
     }
   }
 
@@ -931,31 +1068,28 @@ export class SignalingHub {
     if (this.adminDataConn && this.adminDataConn.open) {
       try {
         this.adminDataConn.send(msg);
-      } catch {
-        /* ignore */
-      }
+      } catch { /* ignore */ }
     }
   }
 
   private broadcastToAll(msg: SignalMessage): void {
-    this.dataConnections.forEach((conn, _peerId) => {
+    this.dataConnections.forEach((conn) => {
       if (conn.open) {
         try {
           conn.send(msg);
-        } catch {
-          /* ignore */
-        }
+        } catch { /* ignore */ }
       }
     });
   }
 
   private broadcastRoomState(): void {
+    const state = this.getRoomState();
     const msg: SignalMessage = {
       type: 'room-state',
-      state: { ...this.roomState },
+      state,
     };
     this.broadcastToAll(msg);
-    this.onRoomStateUpdate?.({ ...this.roomState });
+    this.onRoomStateUpdate?.(state);
   }
 
   // ------------------------------------------------------------------

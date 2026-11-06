@@ -8,6 +8,8 @@ export type BitratePreset = 96000 | 160000 | 320000;
 
 export type VisualizerMode = 'bars' | 'waveform';
 
+export type HapticSensitivity = 'low' | 'mid' | 'high';
+
 /* ── Room & Participant ──────────────────────────────────── */
 
 export interface Participant {
@@ -77,6 +79,8 @@ export type SignalMessage =
   | { type: 'mute-broadcaster'; targetPeerId: string }
   | { type: 'ping'; timestamp: number }
   | { type: 'pong'; timestamp: number }
+  | { type: 'leave'; peerId: string }
+  | { type: 'request-broadcast'; broadcasterPeerId: string; requesterPeerId: string }
   | { type: 'request-peer-list' }
   | { type: 'peer-list'; peers: string[] };
 
@@ -94,6 +98,8 @@ export interface AudioSettings {
   };
   outputDeviceId: string;
   visualizerMode: VisualizerMode;
+  hapticSync: boolean;
+  hapticSensitivity: HapticSensitivity;
 }
 
 export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
@@ -104,5 +110,7 @@ export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   eq: { bass: 0, mid: 0, treble: 0 },
   outputDeviceId: 'default',
   visualizerMode: 'bars',
+  hapticSync: false,
+  hapticSensitivity: 'mid',
 };
 

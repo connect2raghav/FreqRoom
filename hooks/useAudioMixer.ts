@@ -7,7 +7,10 @@ import { AudioSettings, DEFAULT_AUDIO_SETTINGS } from '@/lib/types';
 const PEAK_POLL_INTERVAL_MS = 100;
 const SAMPLE_RATE = 48000;
 
-export function useAudioMixer(streams: Map<string, MediaStream>): {
+export function useAudioMixer(
+  streams: Map<string, MediaStream>,
+  localStream?: MediaStream | null,
+): {
   audioSettings: AudioSettings;
   updateSettings: (settings: Partial<AudioSettings>) => void;
   analyserNode: AnalyserNode | null;
@@ -21,6 +24,7 @@ export function useAudioMixer(streams: Map<string, MediaStream>): {
 } {
   const audioContextRef = useRef<AudioContext | null>(null);
   const pipelinesRef = useRef<Map<string, AudioPipeline>>(new Map());
+  const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const masterGainRef = useRef<GainNode | null>(null);
   const masterAnalyserRef = useRef<AnalyserNode | null>(null);
   const peakIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -93,20 +97,32 @@ export function useAudioMixer(streams: Map<string, MediaStream>): {
     setIsAudioEnabled(true);
   }, [ensureMasterNodes]);
 
-  // Manage pipelines based on streams and audio enabled state
+  // Manage pipelines for remote incoming streams
   useEffect(() => {
-    if (!isAudioEnabled || !audioContextRef.current) return;
+    if (!audioContextRef.current) return;
 
     const ctx = audioContextRef.current;
     ensureMasterNodes(ctx);
 
     const currentPeerIds = new Set(streams.keys());
-    const existingPeerIds = new Set(pipelinesRef.current.keys());
+    const existingPeerIds = new Set(
+      Array.from(pipelinesRef.current.keys()).filter((k) => k !== '__local__'),
+    );
 
-    // Create pipelines for new streams
+    // Create pipelines for new incoming streams
     for (const [peerId, stream] of streams.entries()) {
       if (!existingPeerIds.has(peerId)) {
-        const pipeline = new AudioPipeline(stream, ctx);
+        // Helper audio element ensures Chrome WebRTC audio decoder thread is active
+        if (!audioElementsRef.current.has(peerId)) {
+          const el = new Audio();
+          el.srcObject = stream;
+          el.volume = 0; // keeps decoder active without double-play
+          el.play().catch(() => {});
+          audioElementsRef.current.set(peerId, el);
+        }
+
+        // Web Audio graph with destination output
+        const pipeline = new AudioPipeline(stream, ctx, true);
         pipeline.updateSettings(audioSettings);
 
         // Connect pipeline gain to master gain for visualization
@@ -116,7 +132,6 @@ export function useAudioMixer(streams: Map<string, MediaStream>): {
 
         pipelinesRef.current.set(peerId, pipeline);
 
-        // Initialize per-stream volume
         setPerStreamVolumes((prev) => {
           const next = new Map(prev);
           next.set(peerId, audioSettings.masterVolume);
@@ -134,6 +149,12 @@ export function useAudioMixer(streams: Map<string, MediaStream>): {
           pipelinesRef.current.delete(peerId);
         }
 
+        const el = audioElementsRef.current.get(peerId);
+        if (el) {
+          el.srcObject = null;
+          audioElementsRef.current.delete(peerId);
+        }
+
         setPerStreamVolumes((prev) => {
           const next = new Map(prev);
           next.delete(peerId);
@@ -141,12 +162,37 @@ export function useAudioMixer(streams: Map<string, MediaStream>): {
         });
       }
     }
-  }, [streams, isAudioEnabled, audioSettings, ensureMasterNodes]);
+  }, [streams, audioSettings, ensureMasterNodes]);
+
+  // Manage pipeline for broadcaster's local system audio
+  useEffect(() => {
+    if (!audioContextRef.current) return;
+    const ctx = audioContextRef.current;
+    ensureMasterNodes(ctx);
+
+    if (localStream) {
+      if (!pipelinesRef.current.has('__local__')) {
+        // connectDestination: false prevents broadcaster from hearing their own audio loopback
+        const pipeline = new AudioPipeline(localStream, ctx, false);
+        pipeline.updateSettings(audioSettings);
+
+        if (masterGainRef.current) {
+          pipeline.gainNode.connect(masterGainRef.current);
+        }
+
+        pipelinesRef.current.set('__local__', pipeline);
+      }
+    } else {
+      const pipeline = pipelinesRef.current.get('__local__');
+      if (pipeline) {
+        pipeline.destroy();
+        pipelinesRef.current.delete('__local__');
+      }
+    }
+  }, [localStream, audioSettings, ensureMasterNodes]);
 
   // Peak dB polling
   useEffect(() => {
-    if (!isAudioEnabled) return;
-
     peakIntervalRef.current = setInterval(() => {
       let maxPeak = -Infinity;
       for (const pipeline of pipelinesRef.current.values()) {
@@ -164,7 +210,7 @@ export function useAudioMixer(streams: Map<string, MediaStream>): {
         peakIntervalRef.current = null;
       }
     };
-  }, [isAudioEnabled]);
+  }, []);
 
   const updateSettings = useCallback((partial: Partial<AudioSettings>) => {
     setAudioSettings((prev) => {
@@ -217,6 +263,11 @@ export function useAudioMixer(streams: Map<string, MediaStream>): {
         pipeline.destroy();
       }
       pipelinesRef.current.clear();
+
+      for (const el of audioElementsRef.current.values()) {
+        el.srcObject = null;
+      }
+      audioElementsRef.current.clear();
 
       if (masterGainRef.current) {
         masterGainRef.current.disconnect();

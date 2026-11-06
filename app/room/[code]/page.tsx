@@ -91,6 +91,7 @@ export default function RoomPage() {
     isConnecting,
     error: roomError,
     isBroadcasting,
+    broadcastStream,
     incomingStreams,
     chatMessages,
     emojiReactions,
@@ -112,7 +113,7 @@ export default function RoomPage() {
     resyncAudio,
   } = useJamRoom(roomCode, displayName, isAdminQuery);
 
-  // Audio Mixer DSP pipeline hook
+  // Audio Mixer DSP pipeline hook (handles both incoming remote streams and local broadcast monitoring)
   const {
     audioSettings,
     updateSettings,
@@ -123,7 +124,7 @@ export default function RoomPage() {
     perStreamVolumes,
     setStreamVolume,
     outputDevices,
-  } = useAudioMixer(incomingStreams);
+  } = useAudioMixer(incomingStreams, broadcastStream);
 
   // Listen for Aux Approval to trigger the System Audio Capture Modal
   const [hasShownCaptureModal, setHasShownCaptureModal] = useState(false);
@@ -140,10 +141,14 @@ export default function RoomPage() {
 
   // Find active broadcaster participant
   const currentBroadcaster = useMemo<Participant | null>(() => {
+    if (isBroadcasting && myPeerId) {
+      const me = roomState.participants.find((p) => p.peerId === myPeerId);
+      if (me) return me;
+    }
     if (roomState.activeBroadcasters.length === 0) return null;
     const activeId = roomState.activeBroadcasters[0];
     return roomState.participants.find((p) => p.peerId === activeId) || null;
-  }, [roomState.activeBroadcasters, roomState.participants]);
+  }, [isBroadcasting, myPeerId, roomState.activeBroadcasters, roomState.participants]);
 
   // Is current user admin
   const isUserAdmin = myRole === 'ADMIN' || (roomState.adminPeerId === myPeerId && !!myPeerId);
@@ -197,7 +202,7 @@ export default function RoomPage() {
   };
 
   // Check if room is active with audio
-  const isAudioActive = isBroadcasting || incomingStreams.size > 0;
+  const isAudioActive = isBroadcasting || incomingStreams.size > 0 || peakDb > -50;
 
   return (
     <div className="relative min-h-screen w-full bg-[#0A0F1D] text-white flex flex-col overflow-x-hidden">
